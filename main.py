@@ -32,9 +32,10 @@ if not all([GOOGLE_API_KEY, QDRANT_URL, QDRANT_API_KEY]):
     raise ValueError("Missing one or more environment variables. Please check your .env file.")
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-GEMINI_MODEL = "gemini-1.5-flash-latest"
-TOP_K_CHUNKS = 1
+GEMINI_MODEL = "gemini-1.5-flash"
+TOP_K_CHUNKS = 3  # Increased from 1 to 3 for better context
 COLLECTION_NAME_PREFIX = "bajaj-finsery"
+MIN_SCORE_THRESHOLD = 0.3  # Added minimum similarity score threshold
 
 # Enhanced system prompt for better accuracy and rationale
 ENHANCED_SYSTEM_PROMPT = """You are a specialized document analysis assistant. Your task is to provide accurate, detailed answers and an explainable rationale based strictly on the provided context.
@@ -110,7 +111,7 @@ def extract_text_from_docx(file_path: str) -> List[Dict[str, Any]]:
         logger.error(f"Error extracting text from DOCX {file_path}: {e}")
         return []
 
-def intelligent_chunk_text(text: str, max_words: int = 200, overlap_words: int = 30) -> List[str]:
+def intelligent_chunk_text(text: str, max_words: int = 150, overlap_words: int = 50) -> List[str]:
     """Intelligent text chunking with semantic preservation."""
     paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
     if not paragraphs:
@@ -121,6 +122,14 @@ def intelligent_chunk_text(text: str, max_words: int = 200, overlap_words: int =
     current_word_count = 0
     
     for para in paragraphs:
+        # Preserve section headers
+        if len(para.split()) < 10 and para.endswith(':'):
+            if current_chunk:
+                chunks.append(' '.join(current_chunk))
+            current_chunk = [para]
+            current_word_count = len(current_chunk)
+            continue
+            
         para_words = para.split()
         if len(para_words) > max_words:
             sentences = para.split('. ')
@@ -129,9 +138,14 @@ def intelligent_chunk_text(text: str, max_words: int = 200, overlap_words: int =
                 if not sentence: continue
                 if not sentence.endswith('.'): sentence += '.'
                 sentence_words = sentence.split()
+                
                 if current_word_count + len(sentence_words) > max_words and current_chunk:
                     chunks.append(' '.join(current_chunk))
-                    overlap_text = ' '.join(current_chunk[-overlap_words:]) if len(current_chunk) > overlap_words else ' '.join(current_chunk)
+                    # Keep header if present
+                    if current_chunk[0].endswith(':'):
+                        overlap_text = current_chunk[0] + ' ' + ' '.join(current_chunk[-overlap_words:])
+                    else:
+                        overlap_text = ' '.join(current_chunk[-overlap_words:])
                     current_chunk = overlap_text.split() + sentence_words
                     current_word_count = len(current_chunk)
                 else:
@@ -140,12 +154,15 @@ def intelligent_chunk_text(text: str, max_words: int = 200, overlap_words: int =
         else:
             if current_word_count + len(para_words) > max_words and current_chunk:
                 chunks.append(' '.join(current_chunk))
-                overlap_text = ' '.join(current_chunk[-overlap_words:]) if len(current_chunk) > overlap_words else ' '.join(current_chunk)
+                if current_chunk[0].endswith(':'):
+                    overlap_text = current_chunk[0] + ' ' + ' '.join(current_chunk[-overlap_words:])
+                else:
+                    overlap_text = ' '.join(current_chunk[-overlap_words:])
                 current_chunk = overlap_text.split() + para_words
                 current_word_count = len(current_chunk)
             else:
                 current_chunk.extend(para_words)
-                current_word_count += len(current_chunk)
+                current_word_count += len(para_words)
     
     if current_chunk:
         chunks.append(' '.join(current_chunk))
@@ -241,35 +258,54 @@ def process_and_index_document(document_url: str) -> str:
 def search_document(collection_name: str, query: str, limit: int = TOP_K_CHUNKS) -> tuple[str, List[Dict[str, Any]]]:
     """Search for relevant chunks and return context and source metadata."""
     try:
-        embedding = model.encode([query])[0].tolist()
-        results = qdrant_client.search(
-            collection_name=collection_name,
-            query_vector=embedding,
-            limit=limit,
-            score_threshold=0.25
-        )
+        # Generate embeddings for both the original query and semantic variations
+        query_variations = [
+            query,
+            f"what does the document say about {query}",
+            f"find information regarding {query}"
+        ]
+        embeddings = model.encode(query_variations)
         
-        if not results:
+        # Search with multiple query variations
+        all_results = []
+        for embedding in embeddings:
+            results = qdrant_client.search(
+                collection_name=collection_name,
+                query_vector=embedding.tolist(),
+                limit=limit,
+                score_threshold=MIN_SCORE_THRESHOLD
+            )
+            all_results.extend(results)
+        
+        # Deduplicate and sort by score
+        seen_texts = set()
+        unique_results = []
+        for result in sorted(all_results, key=lambda x: x.score, reverse=True):
+            text = result.payload["text"]
+            if text not in seen_texts:
+                seen_texts.add(text)
+                unique_results.append(result)
+        
+        if not unique_results:
             return "", []
-        
-        results = sorted(results, key=lambda x: x.score, reverse=True)
         
         context_parts = []
         source_documents = []
         
-        for i, result in enumerate(results):
+        for result in unique_results[:limit]:
             text = result.payload["text"]
             page_num = result.payload.get("page_number", "N/A")
             source_file = result.payload.get("source_file", "Unknown")
+            score = result.score
             
-            # Add to context for LLM
-            context_parts.append(f"[{source_file}, Page {page_num}]\n{text}")
+            # Add to context with confidence score
+            context_parts.append(f"[{source_file}, Page {page_num}, Confidence: {score:.2f}]\n{text}")
             
-            # Add to structured output
             source_documents.append({
                 "source_file": source_file,
                 "page_number": page_num,
-                "snippet": text
+                "snippet": text,
+                "confidence": score
             })
         
         return "\n\n".join(context_parts), source_documents
