@@ -32,7 +32,7 @@ if not all([GOOGLE_API_KEY, QDRANT_URL, QDRANT_API_KEY]):
     raise ValueError("Missing one or more environment variables. Please check your .env file.")
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-2.5-flash"
 TOP_K_CHUNKS = 3  # Increased from 1 to 3 for better context
 COLLECTION_NAME_PREFIX = "bajaj-finsery"
 MIN_SCORE_THRESHOLD = 0.3  # Added minimum similarity score threshold
@@ -324,7 +324,22 @@ def generate_answer_with_gemini(query: str, context: str) -> str:
     try:
         gemini_model = genai.GenerativeModel(
             model_name=GEMINI_MODEL,
-            system_instruction="Your task is to provide accurate, detailed answers and an explainable rationale based strictly on the provided context. Respond with a JSON object that contains the keys 'answer' and 'rationale'."
+            generation_config={
+                "temperature": 0.3,  # Lower temperature for more focused responses
+                "top_p": 0.8,
+                "top_k": 40,
+                "max_output_tokens": 2048,
+            },
+            safety_settings=[
+                {
+                    "category": "HARM_CATEGORY_HARASSMENT",
+                    "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+                },
+                {
+                    "category": "HARM_CATEGORY_HATE_SPEECH",
+                    "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+                }
+            ]
         )
         
         response = gemini_model.generate_content(prompt)
@@ -335,14 +350,34 @@ def generate_answer_with_gemini(query: str, context: str) -> str:
             if raw_output.startswith("```json") and raw_output.endswith("```"):
                 raw_output = raw_output[7:-3].strip()
             
-            llm_response = json.loads(raw_output)
-            if "answer" in llm_response:
-                return llm_response.get("answer", "No answer found in LLM response.")
+            # Handle cases where response might be already formatted
+            if isinstance(raw_output, dict):
+                llm_response = raw_output
             else:
-                return "LLM response was missing the 'answer' key."
-        except json.JSONDecodeError:
-            logger.error(f"Failed to parse JSON from LLM: {raw_output}")
-            return "Failed to parse a valid JSON response from the language model."
+                # Remove any potential line breaks or extra whitespace
+                raw_output = raw_output.replace('\n', ' ').replace('\r', '')
+                llm_response = json.loads(raw_output)
+            
+            if "answer" in llm_response:
+                answer = llm_response.get("answer", "").strip()
+                return answer if answer else "No specific answer found in the response."
+            else:
+                # Attempt to extract answer from non-standard format
+                logger.warning("Non-standard JSON response format received")
+                return raw_output[:500] + "..." if len(raw_output) > 500 else raw_output
+                
+        except json.JSONDecodeError as je:
+            logger.error(f"JSON parsing error: {je}")
+            # If JSON parsing fails, attempt to extract content between answer fields
+            try:
+                answer_start = raw_output.find('"answer"') + 10
+                answer_end = raw_output.find('"rationale"') - 2
+                if answer_start > 9 and answer_end > 0:
+                    return raw_output[answer_start:answer_end].strip().strip('"')
+                else:
+                    return raw_output[:500] + "..." if len(raw_output) > 500 else raw_output
+            except Exception:
+                return "Could not parse the response format. Please try reformulating your question."
             
     except Exception as e:
         logger.error(f"Gemini API error: {e}")
