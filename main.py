@@ -32,7 +32,7 @@ if not all([GOOGLE_API_KEY, QDRANT_URL, QDRANT_API_KEY]):
     raise ValueError("Missing one or more environment variables. Please check your .env file.")
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-2.0-flash"
 TOP_K_CHUNKS = 3  # Increased from 1 to 3 for better context
 COLLECTION_NAME_PREFIX = "bajaj-finsery"
 MIN_SCORE_THRESHOLD = 0.3  # Added minimum similarity score threshold
@@ -439,4 +439,5 @@ def run_hackrx():
         return make_response(jsonify({"detail": "Internal server error occurred"}), 500)
 
 if __name__ == "__main__":
+
     app.run(host="0.0.0.0", port=8001)
